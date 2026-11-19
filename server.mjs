@@ -72,7 +72,9 @@ async function discordFetch(pathname, params = {}) {
     }
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`Discord API ${res.status} for ${pathname}${text ? `: ${text.slice(0, 300)}` : ''}`);
+      const err = new Error(`Discord API ${res.status} for ${pathname}${text ? `: ${text.slice(0, 300)}` : ''}`);
+      err.status = res.status;
+      throw err;
     }
     return await res.json();
   }
@@ -168,10 +170,18 @@ async function findChannel(args) {
 
   const results = [];
   for (const guild of guilds) {
-    const channels = await discordFetch(`/guilds/${guild.id}/channels`).catch((e) => {
-      log(`skipping guild ${guild.id}: ${e.message}`);
-      return [];
-    });
+    let channels;
+    try {
+      channels = await discordFetch(`/guilds/${guild.id}/channels`);
+    } catch (e) {
+      // While scanning every guild, an inaccessible guild should not abort the
+      // search; when the caller named a guild, every failure is theirs to see.
+      if (!guildId && (e.status === 403 || e.status === 404)) {
+        log(`skipping guild ${guild.id}: ${e.message}`);
+        continue;
+      }
+      throw e;
+    }
     const categories = new Map(channels.filter((c) => c.type === 4).map((c) => [c.id, c.name]));
     for (const c of channels) {
       if (!String(c.name ?? '').toLowerCase().includes(query)) continue;

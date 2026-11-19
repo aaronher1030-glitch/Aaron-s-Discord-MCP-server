@@ -215,6 +215,25 @@ test('find_channel searches every guild when no guild_id is given', async () => 
   }
 });
 
+test('find_channel surfaces auth failures instead of reporting no matches', async () => {
+  const mock = await mockDiscord({
+    'GET /guilds/1/channels': () => ({ status: 401, body: { message: '401: Unauthorized', code: 0 } }),
+  });
+  const s = startServer({ DISCORD_TOKEN: 'bad-token', DISCORD_API_BASE: mock.base });
+  try {
+    await s.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    const resp = await s.request('tools/call', {
+      name: 'find_channel',
+      arguments: { query: 'tax', guild_id: '1' },
+    });
+    assert.equal(resp.result.isError, true);
+    assert.match(resp.result.content[0].text, /401/);
+  } finally {
+    s.close();
+    mock.close();
+  }
+});
+
 test('list_threads reads active guild threads and archived threads for a channel', async () => {
   const mock = await mockDiscord({
     'GET /guilds/1/threads/active': () => ({
