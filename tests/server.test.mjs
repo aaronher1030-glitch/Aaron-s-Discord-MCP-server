@@ -17,6 +17,12 @@ function startServer(env = {}) {
   let buf = '';
   let stderr = '';
   const waiters = new Map();
+  const unmatched = [];
+  let unmatchedResolver = null;
+  const pushUnmatched = (msg) => {
+    unmatched.push(msg);
+    if (unmatchedResolver) { const r = unmatchedResolver; unmatchedResolver = null; r(); }
+  };
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', (c) => { stderr += c; });
   child.stdout.setEncoding('utf8');
@@ -30,12 +36,20 @@ function startServer(env = {}) {
       let msg;
       try { msg = JSON.parse(line); } catch { continue; }
       const w = waiters.get(msg.id);
-      if (w) { waiters.delete(msg.id); w.resolve(msg); }
+      if (w) { waiters.delete(msg.id); w.resolve(msg); } else { pushUnmatched(msg); }
     }
   });
   let id = 0;
   return {
     stderr: () => stderr,
+    raw(line) { child.stdin.write(line + '\n'); },
+    nextUnmatched() {
+      if (unmatched.length > 0) return Promise.resolve(unmatched.shift());
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`no unmatched message\n${stderr}`)), 5000);
+        unmatchedResolver = () => { clearTimeout(timer); resolve(unmatched.shift()); };
+      });
+    },
     request(method, params) {
       const rid = ++id;
       const p = new Promise((resolve, reject) => {
@@ -99,8 +113,43 @@ test('initialize echoes protocol version and tools/list exposes the five tools',
   }
 });
 
-test('tool calls without a token fail with a clear message and no network access', async () => {
+test('initialize falls back to a supported protocol version and answers ping', async () => {
   const s = startServer({ DISCORD_TOKEN: '' });
+  try {
+    const init = await s.request('initialize', { protocolVersion: 'garbage-1', capabilities: {} });
+    assert.equal(init.result.protocolVersion, '2024-11-05');
+    const ping = await s.request('ping', {});
+    assert.deepEqual(ping.result, {});
+  } finally {
+    s.close();
+  }
+});
+
+test('malformed JSON gets a parse error and the server keeps serving', async () => {
+  const s = startServer({ DISCORD_TOKEN: '' });
+  try {
+    s.raw('{not json');
+    const err = await s.nextUnmatched();
+    assert.equal(err.error.code, -32700);
+    const list = await s.request('tools/list', {});
+    assert.equal(list.result.tools.length, 5);
+  } finally {
+    s.close();
+  }
+});
+
+test('unknown tools return JSON-RPC InvalidParams', async () => {
+  const s = startServer({ DISCORD_TOKEN: '' });
+  try {
+    await s.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    const resp = await s.request('tools/call', { name: 'nope', arguments: {} });
+    assert.equal(resp.error.code, -32602);
+  } finally {
+    s.close();
+  }
+});
+
+test('tool calls without a token fail with a clear message and no network access', async () => {  const s = startServer({ DISCORD_TOKEN: '' });
   try {
     await s.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
     const resp = await s.request('tools/call', { name: 'list_guilds', arguments: {} });
@@ -215,6 +264,80 @@ test('find_channel searches every guild when no guild_id is given', async () => 
   }
 });
 
+test('oldest_first:false keeps the paging footer pointing at the oldest message', async () => {
+  const messages = Array.from({ length: 5 }, (_, i) => {
+    const t = Date.parse('2026-11-18T09:00:00Z') + i * 60000;
+    return {
+      id: ((BigInt(t) - EPOCH) << 22n).toString(),
+      content: `msg ${i}`,
+      author: { username: `u${i}` },
+    };
+  }).reverse();
+
+  const mock = await mockDiscord({
+    'GET /channels/10/messages': (url) => {
+      const limit = Number(url.searchParams.get('limit') || '50');
+      const before = url.searchParams.get('before');
+      let list = messages;
+      if (before) list = messages.filter((m) => BigInt(m.id) < BigInt(before));
+      return { body: list.slice(0, Math.min(limit, 100)) };
+    },
+  });
+  const s = startServer({ DISCORD_TOKEN: 'test-token', DISCORD_API_BASE: mock.base });
+  try {
+    await s.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    const resp = await s.request('tools/call', {
+      name: 'read_messages',
+      arguments: { channel_id: '10', limit: 5, oldest_first: false },
+    });
+    const text = resp.result.content[0].text;
+    const oldestId = messages[messages.length - 1].id;
+    assert.match(text, new RegExp(`Oldest id: ${oldestId}\\b`));
+    const rendered = text.split('\n').filter((l) => /^\[2026/.test(l));
+    assert.match(rendered[0], /msg 4\b/);
+  } finally {
+    s.close();
+    mock.close();
+  }
+});
+
+test('oversized output truncates the message block but keeps the paging footer', async () => {
+  const messages = Array.from({ length: 120 }, (_, i) => {
+    const t = Date.parse('2026-11-18T09:00:00Z') + i * 60000;
+    return {
+      id: ((BigInt(t) - EPOCH) << 22n).toString(),
+      content: `m${i} ${'x'.repeat(900)}`,
+      author: { username: 'long' },
+    };
+  }).reverse();
+
+  const mock = await mockDiscord({
+    'GET /channels/10/messages': (url) => {
+      const limit = Number(url.searchParams.get('limit') || '50');
+      const before = url.searchParams.get('before');
+      let list = messages;
+      if (before) list = messages.filter((m) => BigInt(m.id) < BigInt(before));
+      return { body: list.slice(0, Math.min(limit, 100)) };
+    },
+  });
+  const s = startServer({ DISCORD_TOKEN: 'test-token', DISCORD_API_BASE: mock.base });
+  try {
+    await s.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    const resp = await s.request('tools/call', {
+      name: 'read_messages',
+      arguments: { channel_id: '10', limit: 120 },
+    });
+    const text = resp.result.content[0].text;
+    assert.ok(text.length <= 100000, `output was ${text.length} chars`);
+    assert.match(text, /\[\.\.\. output truncated\]/);
+    assert.match(text, /Oldest id: \d+/);
+    assert.match(text, /call read_messages with before="/);
+  } finally {
+    s.close();
+    mock.close();
+  }
+});
+
 test('find_channel surfaces auth failures instead of reporting no matches', async () => {
   const mock = await mockDiscord({
     'GET /guilds/1/channels': () => ({ status: 401, body: { message: '401: Unauthorized', code: 0 } }),
@@ -278,6 +401,7 @@ test('list_channels hides categories and voice channels but keeps their names as
         { id: '10', name: 'general', type: 0, parent_id: '4' },
         { id: '12', name: 'Voice', type: 2, parent_id: '4' },
         { id: '13', name: 'announce', type: 5 },
+        { id: '14', name: 'media', type: 16 },
       ],
     }),
   });
@@ -292,6 +416,7 @@ test('list_channels hides categories and voice channels but keeps their names as
     assert.match(text, /#general/);
     assert.match(text, /under Community/);
     assert.match(text, /#announce/);
+    assert.match(text, /#media/);
     assert.doesNotMatch(text, /#Voice/);
   } finally {
     s.close();

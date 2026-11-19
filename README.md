@@ -85,7 +85,7 @@ The token belongs in the MCP config or environment. Never in this repository, ne
 | `list_channels` | `guild_id` | Text, announcement, forum, and thread channels with ids. |
 | `find_channel` | `query`, optional `guild_id` | Case-insensitive name search across all guilds. |
 | `read_messages` | `channel_id`, optional `limit` (default 100, max 1000), `before`, `since` (ISO date), `oldest_first` | Paginated message history for a channel or thread. |
-| `list_threads` | `guild_id`, optional `channel_id` | Active threads; archived public threads when a channel is given. |
+| `list_threads` | `guild_id`, optional `channel_id` | Active threads; the first 100 archived public threads when a channel is given. |
 
 Typical prompts this enables:
 
@@ -94,6 +94,10 @@ Typical prompts this enables:
 - "Find the channel about tax and list its most recent threads."
 
 `read_messages` returns messages in chronological order with `Oldest id` and `Newest id` in the footer, so the model can page further back by passing `before`.
+
+Forum channels are read through their threads: call `list_threads` with the forum's `channel_id`, then `read_messages` with a thread id. Discord rejects `read_messages` on a forum channel id itself.
+
+Protocol versions 2024-11-05, 2025-03-26, and 2025-06-18 are supported; any other requested version falls back to 2024-11-05.
 
 ## Environment
 
@@ -106,6 +110,7 @@ Typical prompts this enables:
 
 - **Post messages.** There is no send tool in this version.
 - **Search Discord globally.** Discord does not expose message search to bots over the REST API.
+- **Read forum channels directly.** Read their threads instead (see above).
 - **Read channels the bot cannot see.** Permissions are enforced by Discord, not by this server.
 - **Read DMs.** Not implemented.
 
